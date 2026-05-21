@@ -196,7 +196,7 @@ func TestDnsQueryUsesGlueRecordsAsNextServers(t *testing.T) {
 	}
 }
 
-func TestDnsQueryDebugExplainsRootAndGlueSteps(t *testing.T) {
+func TestDnsQueryDebugExplainsDnsPacketSections(t *testing.T) {
 	question := dnsmessage.Question{
 		Name:  dnsmessage.MustNewName("www.exemplo.com."),
 		Type:  dnsmessage.TypeA,
@@ -224,11 +224,80 @@ func TestDnsQueryDebugExplainsRootAndGlueSteps(t *testing.T) {
 	}
 
 	output := logs.String()
-	if !strings.Contains(output, "servidores raiz") {
-		t.Fatalf("expected debug log to explain root servers, got:\n%s", output)
+	expectedParts := []string{
+		"Pergunta original do cliente",
+		"servidores RAIZ",
+		"SEÇÃO ANSWER",
+		"ANSWER[1]",
+		"valor=203.0.113.10",
+		"Decisão: o bit Authoritative=true",
 	}
-	if !strings.Contains(output, "Resposta autoritativa recebida") {
-		t.Fatalf("expected debug log to explain authoritative answer, got:\n%s", output)
+	for _, expectedPart := range expectedParts {
+		if !strings.Contains(output, expectedPart) {
+			t.Fatalf("expected debug log to contain %q, got:\n%s", expectedPart, output)
+		}
+	}
+}
+
+func TestDnsQueryDebugExplainsDelegationAndGlueRecords(t *testing.T) {
+	question := dnsmessage.Question{
+		Name:  dnsmessage.MustNewName("www.exemplo.com."),
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}
+	var logs bytes.Buffer
+	previousOutput := debugLogger.Writer()
+	debugLogger.SetOutput(&logs)
+	defer debugLogger.SetOutput(previousOutput)
+
+	_, err := dnsQueryWithExchanger([]net.IP{net.ParseIP("198.41.0.4")}, question, func(servers []net.IP, q dnsmessage.Question) (*dnsmessage.Parser, *dnsmessage.Header, error) {
+		if servers[0].Equal(net.ParseIP("198.41.0.4")) {
+			return parserForMessage(t, dnsmessage.Message{
+				Header:    dnsmessage.Header{Response: true},
+				Questions: []dnsmessage.Question{q},
+				Authorities: []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("com."), Type: dnsmessage.TypeNS, Class: dnsmessage.ClassINET, TTL: 172800},
+						Body:   &dnsmessage.NSResource{NS: dnsmessage.MustNewName("a.gtld-servers.net.")},
+					},
+				},
+				Additionals: []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("a.gtld-servers.net."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 172800},
+						Body:   &dnsmessage.AResource{A: [4]byte{203, 0, 113, 53}},
+					},
+				},
+			})
+		}
+		return parserForMessage(t, dnsmessage.Message{
+			Header:    dnsmessage.Header{Response: true, Authoritative: true},
+			Questions: []dnsmessage.Question{q},
+			Answers: []dnsmessage.Resource{
+				{
+					Header: dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+					Body:   &dnsmessage.AResource{A: [4]byte{203, 0, 113, 10}},
+				},
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("dnsQueryWithExchanger error: %s", err)
+	}
+
+	output := logs.String()
+	expectedParts := []string{
+		"SEÇÃO AUTHORITY",
+		"delegações",
+		"nameserver=a.gtld-servers.net.",
+		"SEÇÃO ADDITIONAL",
+		"glue records",
+		"valor=203.0.113.53",
+		"Próximo passo: perguntar diretamente",
+	}
+	for _, expectedPart := range expectedParts {
+		if !strings.Contains(output, expectedPart) {
+			t.Fatalf("expected debug log to contain %q, got:\n%s", expectedPart, output)
+		}
 	}
 }
 

@@ -57,10 +57,18 @@ func dnsQuery(servers []net.IP, question dnsmessage.Question) (*dnsmessage.Messa
 type dnsExchanger func([]net.IP, dnsmessage.Question) (*dnsmessage.Parser, *dnsmessage.Header, error)
 
 func dnsQueryWithExchanger(servers []net.IP, question dnsmessage.Question, exchange dnsExchanger) (*dnsmessage.Message, error) {
-	debugf("Iniciando resolução iterativa para %s. Primeiro passo: perguntar aos servidores raiz.", question.Name.String())
+	debugf("=== INÍCIO DA RESOLUÇÃO RECURSIVA ===")
+	debugf("Pergunta original do cliente: nome=%s tipo=%s classe=%s", question.Name.String(), question.Type.String(), question.Class.String())
+	debugf("Ideia do DNS: se eu não sei a resposta, pergunto para quem está mais acima na árvore. Primeiro passo: servidores raiz.")
 	currentServers := servers
 	for i := 0; i < 3; i++ {
-		debugf("Rodada %d: consultando %d servidor(es): %s", i+1, len(currentServers), formatServers(currentServers))
+		debugf("--- PASSO %d ---", i+1)
+		debugf("Servidores que podem ajudar neste passo: %s", formatServers(currentServers))
+		if i == 0 {
+			debugf("Estes são servidores RAIZ: eles conhecem a raiz da árvore DNS e indicam quem cuida de TLDs como .com, .br, .org.")
+		} else {
+			debugf("Estes servidores vieram da resposta anterior. Agora o resolver desce mais um nível na árvore DNS.")
+		}
 		dnsAnswer, header, err := exchange(currentServers, question)
 		if err != nil {
 			return nil, err
@@ -69,22 +77,24 @@ func dnsQueryWithExchanger(servers []net.IP, question dnsmessage.Question, excha
 		if err != nil {
 			return nil, err
 		}
+		debugResources("ANSWER", "respostas diretas para a pergunta. Se o servidor for autoritativo, normalmente é aqui que está o resultado final.", parsedAnswers)
 		if header.Authoritative {
-			debugf("Resposta autoritativa recebida. O servidor consultado conhece a resposta final para %s.", question.Name.String())
-			debugf("Total de respostas finais: %d", len(parsedAnswers))
+			debugf("Decisão: o bit Authoritative=true veio ligado. Isso significa que o servidor consultado tem autoridade sobre este nome.")
+			debugf("Fim: vou devolver ao cliente as %d resposta(s) da seção ANSWER.", len(parsedAnswers))
 			return &dnsmessage.Message{
 				Header:  dnsmessage.Header{Response: true},
 				Answers: parsedAnswers,
 			}, nil
 		}
-		debugf("Ainda nao e a resposta final. O servidor devolveu %d resposta(s) e vai indicar proximos servidores DNS.", len(parsedAnswers))
+		debugf("Decisão: Authoritative=false. Ainda não é a resposta final; precisamos olhar AUTHORITY e ADDITIONAL para descobrir o próximo DNS.")
 		authorities, err := dnsAnswer.AllAuthorities()
 		if err != nil {
 			return nil, err
 		}
+		debugResources("AUTHORITY", "delegações. Aqui aparecem registros NS dizendo quais nameservers cuidam da próxima zona.", authorities)
 
 		if len(authorities) == 0 {
-			debugf("Nenhuma autoridade foi retornada. Isso equivale a nome nao encontrado para esta consulta.")
+			debugf("Decisão: não veio nenhuma autoridade. Sem NS para continuar, retorno NameError para o cliente.")
 			return &dnsmessage.Message{
 				Header: dnsmessage.Header{RCode: dnsmessage.RCodeNameError},
 			}, nil
@@ -105,6 +115,7 @@ func dnsQueryWithExchanger(servers []net.IP, question dnsmessage.Question, excha
 		if err != nil {
 			return nil, err
 		}
+		debugResources("ADDITIONAL", "dados extras. Frequentemente traz glue records: IPs dos NS citados em AUTHORITY.", additionals)
 		newResolverServersFound := false
 		nextServers := []net.IP{}
 		// A secao Additional pode trazer glue records: IPs dos nameservers
@@ -123,20 +134,23 @@ func dnsQueryWithExchanger(servers []net.IP, question dnsmessage.Question, excha
 			}
 		}
 		if !newResolverServersFound {
-			debugf("Recebemos NS, mas nenhum IP em Additional. Este exemplo ainda nao resolve o nome do nameserver separadamente.")
+			debugf("Decisão: recebi nomes de NS em AUTHORITY, mas nenhum IP correspondente em ADDITIONAL.")
+			debugf("Limitação deste resolver didático: ele ainda não faz uma nova resolução só para descobrir o IP do nameserver.")
 			break
 		}
+		debugf("Decisão: encontrei %d glue record(s). Próximo passo: perguntar diretamente para %s.", len(nextServers), formatServers(nextServers))
 		currentServers = nextServers
 	}
 
-	debugf("Nao foi possivel concluir a resolucao iterativa para %s dentro do limite de rodadas.", question.Name.String())
+	debugf("Fim com falha: não foi possível concluir a resolução iterativa para %s dentro do limite de rodadas.", question.Name.String())
 	return &dnsmessage.Message{
 		Header: dnsmessage.Header{RCode: dnsmessage.RCodeServerFailure},
 	}, nil
 }
 
 func outgoingDnsQuery(servers []net.IP, question dnsmessage.Question) (*dnsmessage.Parser, *dnsmessage.Header, error) {
-	debugf("Montando pacote DNS UDP para %s e enviando para %s.", question.Name.String(), formatServers(servers))
+	debugf("Montando pacote DNS UDP.")
+	debugf("QUESTION que será enviada ao DNS remoto: nome=%s tipo=%s classe=%s", question.Name.String(), question.Type.String(), question.Class.String())
 	max := ^uint16(0)
 	randonNumber, err := rand.Int(rand.Reader, big.NewInt(int64(max)))
 	if err != nil {
@@ -154,6 +168,7 @@ func outgoingDnsQuery(servers []net.IP, question dnsmessage.Question) (*dnsmessa
 	if err != nil {
 		return nil, nil, err
 	}
+	debugf("Pacote montado: ID=%d QR=false Opcode=%d Questions=%d. Enviando por UDP/53.", message.Header.ID, message.Header.OpCode, len(message.Questions))
 	var conn net.Conn
 	for _, server := range servers {
 		debugf("Tentando abrir conexao UDP com DNS %s:53.", server.String())
@@ -194,6 +209,10 @@ func outgoingDnsQuery(servers []net.IP, question dnsmessage.Question) (*dnsmessa
 	if len(questions) != len(message.Questions) {
 		return nil, nil, fmt.Errorf("answer packet doesn't have the same amount of questions")
 	}
+	debugf("SEÇÃO QUESTION ecoada pelo servidor remoto:")
+	for _, answeredQuestion := range questions {
+		debugf("  QUESTION nome=%s tipo=%s classe=%s", answeredQuestion.Name.String(), answeredQuestion.Type.String(), answeredQuestion.Class.String())
+	}
 
 	err = p.SkipAllQuestions()
 	if err != nil {
@@ -224,4 +243,40 @@ func formatServers(servers []net.IP) string {
 		formatted = append(formatted, server.String())
 	}
 	return strings.Join(formatted, ", ")
+}
+
+func debugResources(sectionName, explanation string, resources []dnsmessage.Resource) {
+	debugf("SEÇÃO %s: %s", sectionName, explanation)
+	if len(resources) == 0 {
+		debugf("  %s vazia.", sectionName)
+		return
+	}
+	for i, resource := range resources {
+		debugf("  %s[%d] %s", sectionName, i+1, formatResource(resource))
+	}
+}
+
+func formatResource(resource dnsmessage.Resource) string {
+	header := resource.Header
+	prefix := fmt.Sprintf("nome=%s tipo=%s classe=%s ttl=%d", header.Name.String(), header.Type.String(), header.Class.String(), header.TTL)
+	switch body := resource.Body.(type) {
+	case *dnsmessage.AResource:
+		return fmt.Sprintf("%s valor=%s", prefix, net.IP(body.A[:]).String())
+	case *dnsmessage.AAAAResource:
+		return fmt.Sprintf("%s valor=%s", prefix, net.IP(body.AAAA[:]).String())
+	case *dnsmessage.NSResource:
+		return fmt.Sprintf("%s nameserver=%s", prefix, body.NS.String())
+	case *dnsmessage.CNAMEResource:
+		return fmt.Sprintf("%s canonical=%s", prefix, body.CNAME.String())
+	case *dnsmessage.MXResource:
+		return fmt.Sprintf("%s preference=%d host=%s", prefix, body.Pref, body.MX.String())
+	case *dnsmessage.TXTResource:
+		return fmt.Sprintf("%s texto=%q", prefix, strings.Join(body.TXT, " "))
+	case *dnsmessage.SOAResource:
+		return fmt.Sprintf("%s ns=%s mbox=%s serial=%d", prefix, body.NS.String(), body.MBox.String(), body.Serial)
+	case *dnsmessage.PTRResource:
+		return fmt.Sprintf("%s ptr=%s", prefix, body.PTR.String())
+	default:
+		return fmt.Sprintf("%s valor=%T", prefix, body)
+	}
 }

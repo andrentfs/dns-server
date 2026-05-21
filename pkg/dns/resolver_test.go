@@ -196,6 +196,101 @@ func TestDnsQueryUsesGlueRecordsAsNextServers(t *testing.T) {
 	}
 }
 
+func TestDnsQueryResolvesNameserverAddressWhenGlueIsMissing(t *testing.T) {
+	question := dnsmessage.Question{
+		Name:  dnsmessage.MustNewName("www.awtecnologia.com.br."),
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}
+	rootServer := net.ParseIP("198.41.0.4")
+	brServer := net.ParseIP("200.219.159.10")
+	secServer := net.ParseIP("200.160.0.11")
+	finalAnswer := [4]byte{198, 51, 100, 10}
+	queries := []dnsmessage.Question{}
+	queryServers := [][]net.IP{}
+
+	response, err := dnsQueryWithExchanger([]net.IP{rootServer}, question, func(servers []net.IP, q dnsmessage.Question) (*dnsmessage.Parser, *dnsmessage.Header, error) {
+		queries = append(queries, q)
+		queryServers = append(queryServers, append([]net.IP(nil), servers...))
+
+		switch q.Name.String() {
+		case "www.awtecnologia.com.br.":
+			if servers[0].Equal(rootServer) {
+				return parserForMessage(t, dnsmessage.Message{
+					Header:    dnsmessage.Header{Response: true},
+					Questions: []dnsmessage.Question{q},
+					Authorities: []dnsmessage.Resource{
+						{
+							Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("br."), Type: dnsmessage.TypeNS, Class: dnsmessage.ClassINET},
+							Body:   &dnsmessage.NSResource{NS: dnsmessage.MustNewName("f.dns.br.")},
+						},
+					},
+					Additionals: []dnsmessage.Resource{
+						{
+							Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("f.dns.br."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+							Body:   &dnsmessage.AResource{A: [4]byte{200, 219, 159, 10}},
+						},
+					},
+				})
+			}
+			if servers[0].Equal(brServer) {
+				return parserForMessage(t, dnsmessage.Message{
+					Header:    dnsmessage.Header{Response: true},
+					Questions: []dnsmessage.Question{q},
+					Authorities: []dnsmessage.Resource{
+						{
+							Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("awtecnologia.com.br."), Type: dnsmessage.TypeNS, Class: dnsmessage.ClassINET},
+							Body:   &dnsmessage.NSResource{NS: dnsmessage.MustNewName("a.sec.dns.br.")},
+						},
+					},
+				})
+			}
+			return parserForMessage(t, dnsmessage.Message{
+				Header:    dnsmessage.Header{Response: true, Authoritative: true},
+				Questions: []dnsmessage.Question{q},
+				Answers: []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+						Body:   &dnsmessage.AResource{A: finalAnswer},
+					},
+				},
+			})
+		case "a.sec.dns.br.":
+			return parserForMessage(t, dnsmessage.Message{
+				Header:    dnsmessage.Header{Response: true, Authoritative: true},
+				Questions: []dnsmessage.Question{q},
+				Answers: []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+						Body:   &dnsmessage.AResource{A: [4]byte{200, 160, 0, 11}},
+					},
+				},
+			})
+		default:
+			t.Fatalf("unexpected query for %s", q.Name.String())
+		}
+		return nil, nil, nil
+	})
+	if err != nil {
+		t.Fatalf("dnsQueryWithExchanger error: %s", err)
+	}
+	if len(queryServers) != 4 {
+		t.Fatalf("expected 4 queries including nameserver address lookup, got %d", len(queryServers))
+	}
+	if queries[2].Name.String() != "a.sec.dns.br." || queries[2].Type != dnsmessage.TypeA {
+		t.Fatalf("expected third query to resolve nameserver A record, got %s %s", queries[2].Name.String(), queries[2].Type.String())
+	}
+	if !queryServers[3][0].Equal(secServer) {
+		t.Fatalf("expected final query to use resolved nameserver server %s, got %v", secServer, queryServers[3])
+	}
+	if response.Header.RCode != dnsmessage.RCodeSuccess {
+		t.Fatalf("expected successful response, got %s", response.Header.RCode.String())
+	}
+	if gotAnswer := response.Answers[0].Body.(*dnsmessage.AResource).A; gotAnswer != finalAnswer {
+		t.Fatalf("expected final A answer %v, got %v", finalAnswer, gotAnswer)
+	}
+}
+
 func TestDnsQueryDebugExplainsDnsPacketSections(t *testing.T) {
 	question := dnsmessage.Question{
 		Name:  dnsmessage.MustNewName("www.exemplo.com."),

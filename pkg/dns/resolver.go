@@ -14,6 +14,7 @@ import (
 )
 
 const ROOT_SERVERS = "198.41.0.4,199.9.14.201,192.33.4.12, 199.7.91.13, 192.203.230.10, 192.5.5.241, 192.112.36.4,198.97.190.53"
+const maxIterativeSteps = 8
 
 var debugLogger = log.New(os.Stdout, "[dns-debug] ", log.LstdFlags|log.Lmicroseconds)
 
@@ -57,11 +58,15 @@ func dnsQuery(servers []net.IP, question dnsmessage.Question) (*dnsmessage.Messa
 type dnsExchanger func([]net.IP, dnsmessage.Question) (*dnsmessage.Parser, *dnsmessage.Header, error)
 
 func dnsQueryWithExchanger(servers []net.IP, question dnsmessage.Question, exchange dnsExchanger) (*dnsmessage.Message, error) {
+	return dnsQueryWithExchangerDepth(servers, question, exchange, 0)
+}
+
+func dnsQueryWithExchangerDepth(servers []net.IP, question dnsmessage.Question, exchange dnsExchanger, depth int) (*dnsmessage.Message, error) {
 	debugf("=== INÍCIO DA RESOLUÇÃO RECURSIVA ===")
 	debugf("Pergunta original do cliente: nome=%s tipo=%s classe=%s", question.Name.String(), question.Type.String(), question.Class.String())
 	debugf("Ideia do DNS: se eu não sei a resposta, pergunto para quem está mais acima na árvore. Primeiro passo: servidores raiz.")
 	currentServers := servers
-	for i := 0; i < 3; i++ {
+	for i := 0; i < maxIterativeSteps; i++ {
 		debugf("--- PASSO %d ---", i+1)
 		debugf("Servidores que podem ajudar neste passo: %s", formatServers(currentServers))
 		if i == 0 {
@@ -116,29 +121,25 @@ func dnsQueryWithExchanger(servers []net.IP, question dnsmessage.Question, excha
 			return nil, err
 		}
 		debugResources("ADDITIONAL", "dados extras. Frequentemente traz glue records: IPs dos NS citados em AUTHORITY.", additionals)
-		newResolverServersFound := false
-		nextServers := []net.IP{}
 		// A secao Additional pode trazer glue records: IPs dos nameservers
 		// listados em Authority. Com esses IPs podemos perguntar diretamente
 		// ao proximo nivel, sem precisar resolver o nome do nameserver antes.
-		for _, additional := range additionals {
-			if additional.Header.Type == dnsmessage.TypeA {
-				for _, nameserver := range nameservers {
-					if additional.Header.Name.String() == nameserver {
-						newResolverServersFound = true
-						ip := net.IP(additional.Body.(*dnsmessage.AResource).A[:])
-						nextServers = append(nextServers, ip)
-						debugf("Additional/glue: %s tem IP %s. Esse sera um dos proximos DNS consultados.", nameserver, ip.String())
-					}
-				}
-			}
-		}
-		if !newResolverServersFound {
+		nextServers := glueServers(nameservers, additionals)
+		if len(nextServers) == 0 {
 			debugf("Decisão: recebi nomes de NS em AUTHORITY, mas nenhum IP correspondente em ADDITIONAL.")
-			debugf("Limitação deste resolver didático: ele ainda não faz uma nova resolução só para descobrir o IP do nameserver.")
-			break
+			debugf("Agora vou resolver o endereço A de cada nameserver, começando novamente pelos servidores raiz.")
+			nextServers, err = resolveNameserverIPs(nameservers, exchange, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			if len(nextServers) == 0 {
+				debugf("Não consegui descobrir nenhum IP para os nameservers recebidos.")
+				break
+			}
+			debugf("Decisão: resolvi %d nameserver(s). Próximo passo: perguntar diretamente para %s.", len(nextServers), formatServers(nextServers))
+		} else {
+			debugf("Decisão: encontrei %d glue record(s). Próximo passo: perguntar diretamente para %s.", len(nextServers), formatServers(nextServers))
 		}
-		debugf("Decisão: encontrei %d glue record(s). Próximo passo: perguntar diretamente para %s.", len(nextServers), formatServers(nextServers))
 		currentServers = nextServers
 	}
 
@@ -146,6 +147,59 @@ func dnsQueryWithExchanger(servers []net.IP, question dnsmessage.Question, excha
 	return &dnsmessage.Message{
 		Header: dnsmessage.Header{RCode: dnsmessage.RCodeServerFailure},
 	}, nil
+}
+
+func glueServers(nameservers []string, additionals []dnsmessage.Resource) []net.IP {
+	nextServers := []net.IP{}
+	for _, additional := range additionals {
+		if additional.Header.Type != dnsmessage.TypeA {
+			continue
+		}
+		for _, nameserver := range nameservers {
+			if additional.Header.Name.String() == nameserver {
+				ip := net.IP(additional.Body.(*dnsmessage.AResource).A[:])
+				nextServers = append(nextServers, ip)
+				debugf("Additional/glue: %s tem IP %s. Esse sera um dos proximos DNS consultados.", nameserver, ip.String())
+			}
+		}
+	}
+	return nextServers
+}
+
+func resolveNameserverIPs(nameservers []string, exchange dnsExchanger, depth int) ([]net.IP, error) {
+	if depth > maxIterativeSteps {
+		debugf("Limite de resolução auxiliar atingido ao tentar descobrir IP de nameserver.")
+		return nil, nil
+	}
+
+	servers := []net.IP{}
+	for _, nameserver := range nameservers {
+		nsName, err := dnsmessage.NewName(nameserver)
+		if err != nil {
+			return nil, err
+		}
+		debugf("Resolvendo IP do nameserver %s com uma consulta A auxiliar.", nameserver)
+		response, err := dnsQueryWithExchangerDepth(gerRootServers(), dnsmessage.Question{
+			Name:  nsName,
+			Type:  dnsmessage.TypeA,
+			Class: dnsmessage.ClassINET,
+		}, exchange, depth)
+		if err != nil {
+			return nil, err
+		}
+		for _, answer := range response.Answers {
+			if answer.Header.Type != dnsmessage.TypeA {
+				continue
+			}
+			ip := net.IP(answer.Body.(*dnsmessage.AResource).A[:])
+			servers = append(servers, ip)
+			debugf("Nameserver %s resolvido para %s.", nameserver, ip.String())
+		}
+		if len(servers) > 0 {
+			return servers, nil
+		}
+	}
+	return servers, nil
 }
 
 func outgoingDnsQuery(servers []net.IP, question dnsmessage.Question) (*dnsmessage.Parser, *dnsmessage.Header, error) {

@@ -8,9 +8,10 @@ Quando um cliente pergunta por um dominio, o programa recebe o pacote DNS, le a 
 2. Pergunta primeiro para servidores raiz.
 3. Le a resposta e procura indicacoes de proximos servidores na secao `AUTHORITY`.
 4. Procura os IPs desses servidores na secao `ADDITIONAL`, tambem chamados de glue records.
-5. Consulta o proximo servidor DNS indicado.
-6. Repete o processo ate encontrar uma resposta autoritativa.
-7. Devolve a resposta para o cliente.
+5. Se nao houver glue record, resolve o registro `A` do nameserver indicado.
+6. Consulta o proximo servidor DNS indicado.
+7. Repete o processo ate encontrar uma resposta autoritativa.
+8. Devolve a resposta para o cliente.
 
 O programa imprime logs de debug em portugues para ajudar no aprendizado. Esses logs mostram as partes internas de uma consulta DNS, incluindo:
 
@@ -53,7 +54,6 @@ Este e um resolvedor didatico, nao um DNS pronto para producao. Ele ainda tem al
 - nao implementa cache;
 - nao valida DNSSEC;
 - nao trata todos os casos do protocolo DNS;
-- usa glue records IPv4 (`A`) para continuar a resolucao;
-- nao resolve separadamente o nome de um nameserver quando a resposta nao traz o IP em `ADDITIONAL`.
+- usa IPv4 (`A`) para consultar nameservers.
 
 Mesmo com essas limitacoes, ele e util para visualizar o funcionamento basico do DNS e entender como um resolvedor sai dos servidores raiz ate chegar a uma resposta final.

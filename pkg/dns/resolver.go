@@ -83,25 +83,33 @@ func dnsQueryWithExchangerDepth(servers []net.IP, question dnsmessage.Question, 
 			return nil, err
 		}
 		debugResources("ANSWER", "respostas diretas para a pergunta. Se o servidor for autoritativo, normalmente é aqui que está o resultado final.", parsedAnswers)
-		if header.Authoritative {
-			debugf("Decisão: o bit Authoritative=true veio ligado. Isso significa que o servidor consultado tem autoridade sobre este nome.")
-			debugf("Fim: vou devolver ao cliente as %d resposta(s) da seção ANSWER.", len(parsedAnswers))
-			return &dnsmessage.Message{
-				Header:  dnsmessage.Header{Response: true},
-				Answers: parsedAnswers,
-			}, nil
-		}
-		debugf("Decisão: Authoritative=false. Ainda não é a resposta final; precisamos olhar AUTHORITY e ADDITIONAL para descobrir o próximo DNS.")
 		authorities, err := dnsAnswer.AllAuthorities()
 		if err != nil {
 			return nil, err
 		}
+		additionals, err := dnsAnswer.AllAdditionals()
+		if err != nil {
+			return nil, err
+		}
+		if header.Authoritative {
+			debugf("Decisão: o bit Authoritative=true veio ligado. Isso significa que o servidor consultado tem autoridade sobre este nome.")
+			debugf("Fim: vou devolver ao cliente as %d resposta(s) da seção ANSWER.", len(parsedAnswers))
+			return &dnsmessage.Message{
+				Header:      dnsmessage.Header{Response: true},
+				Questions:   []dnsmessage.Question{question},
+				Answers:     parsedAnswers,
+				Authorities: authorities,
+				Additionals: additionals,
+			}, nil
+		}
+		debugf("Decisão: Authoritative=false. Ainda não é a resposta final; precisamos olhar AUTHORITY e ADDITIONAL para descobrir o próximo DNS.")
 		debugResources("AUTHORITY", "delegações. Aqui aparecem registros NS dizendo quais nameservers cuidam da próxima zona.", authorities)
 
 		if len(authorities) == 0 {
 			debugf("Decisão: não veio nenhuma autoridade. Sem NS para continuar, retorno NameError para o cliente.")
 			return &dnsmessage.Message{
-				Header: dnsmessage.Header{RCode: dnsmessage.RCodeNameError},
+				Header:    dnsmessage.Header{Response: true, RCode: dnsmessage.RCodeNameError},
+				Questions: []dnsmessage.Question{question},
 			}, nil
 		}
 
@@ -116,10 +124,6 @@ func dnsQueryWithExchangerDepth(servers []net.IP, question dnsmessage.Question, 
 			}
 		}
 
-		additionals, err := dnsAnswer.AllAdditionals()
-		if err != nil {
-			return nil, err
-		}
 		debugResources("ADDITIONAL", "dados extras. Frequentemente traz glue records: IPs dos NS citados em AUTHORITY.", additionals)
 		// A secao Additional pode trazer glue records: IPs dos nameservers
 		// listados em Authority. Com esses IPs podemos perguntar diretamente
@@ -145,7 +149,8 @@ func dnsQueryWithExchangerDepth(servers []net.IP, question dnsmessage.Question, 
 
 	debugf("Fim com falha: não foi possível concluir a resolução iterativa para %s dentro do limite de rodadas.", question.Name.String())
 	return &dnsmessage.Message{
-		Header: dnsmessage.Header{RCode: dnsmessage.RCodeServerFailure},
+		Header:    dnsmessage.Header{Response: true, RCode: dnsmessage.RCodeServerFailure},
+		Questions: []dnsmessage.Question{question},
 	}, nil
 }
 

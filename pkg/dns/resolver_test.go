@@ -291,6 +291,72 @@ func TestDnsQueryResolvesNameserverAddressWhenGlueIsMissing(t *testing.T) {
 	}
 }
 
+func TestDnsQueryAuthoritativeEmptyAnswerKeepsQuestion(t *testing.T) {
+	question := dnsmessage.Question{
+		Name:  dnsmessage.MustNewName("awtecnologia.com.br."),
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}
+
+	response, err := dnsQueryWithExchanger([]net.IP{net.ParseIP("200.160.0.11")}, question, func(servers []net.IP, q dnsmessage.Question) (*dnsmessage.Parser, *dnsmessage.Header, error) {
+		return parserForMessage(t, dnsmessage.Message{
+			Header:    dnsmessage.Header{Response: true, Authoritative: true},
+			Questions: []dnsmessage.Question{q},
+		})
+	})
+	if err != nil {
+		t.Fatalf("dnsQueryWithExchanger error: %s", err)
+	}
+	if len(response.Questions) != 1 {
+		t.Fatalf("expected response to keep original question, got %d question(s)", len(response.Questions))
+	}
+	if response.Questions[0] != question {
+		t.Fatalf("expected response question %+v, got %+v", question, response.Questions[0])
+	}
+}
+
+func TestDnsQueryAuthoritativeEmptyAnswerKeepsAuthorities(t *testing.T) {
+	question := dnsmessage.Question{
+		Name:  dnsmessage.MustNewName("awtecnologia.com.br."),
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}
+	soa := dnsmessage.Resource{
+		Header: dnsmessage.ResourceHeader{
+			Name:  dnsmessage.MustNewName("awtecnologia.com.br."),
+			Type:  dnsmessage.TypeSOA,
+			Class: dnsmessage.ClassINET,
+			TTL:   3600,
+		},
+		Body: &dnsmessage.SOAResource{
+			NS:      dnsmessage.MustNewName("a.sec.dns.br."),
+			MBox:    dnsmessage.MustNewName("hostmaster.registro.br."),
+			Serial:  1,
+			Refresh: 3600,
+			Retry:   900,
+			Expire:  604800,
+			MinTTL:  3600,
+		},
+	}
+
+	response, err := dnsQueryWithExchanger([]net.IP{net.ParseIP("200.160.0.11")}, question, func(servers []net.IP, q dnsmessage.Question) (*dnsmessage.Parser, *dnsmessage.Header, error) {
+		return parserForMessage(t, dnsmessage.Message{
+			Header:      dnsmessage.Header{Response: true, Authoritative: true},
+			Questions:   []dnsmessage.Question{q},
+			Authorities: []dnsmessage.Resource{soa},
+		})
+	})
+	if err != nil {
+		t.Fatalf("dnsQueryWithExchanger error: %s", err)
+	}
+	if len(response.Authorities) != 1 {
+		t.Fatalf("expected response to keep one authority, got %d", len(response.Authorities))
+	}
+	if response.Authorities[0].Header.Type != dnsmessage.TypeSOA {
+		t.Fatalf("expected SOA authority, got %s", response.Authorities[0].Header.Type.String())
+	}
+}
+
 func TestDnsQueryDebugExplainsDnsPacketSections(t *testing.T) {
 	question := dnsmessage.Question{
 		Name:  dnsmessage.MustNewName("www.exemplo.com."),

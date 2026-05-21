@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"bytes"
 	"crypto/rand"
 	"fmt"
 	"math/big"
@@ -114,4 +115,144 @@ func TestOutgoingDnsQuery(t *testing.T) {
 	if len(parsedAuthorities) == 0 {
 		t.Fatalf("No answers received")
 	}
+}
+
+func TestDnsQueryUsesGlueRecordsAsNextServers(t *testing.T) {
+	question := dnsmessage.Question{
+		Name:  dnsmessage.MustNewName("www.exemplo.com."),
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}
+	rootServer := net.ParseIP("198.41.0.4")
+	authoritativeServer := net.ParseIP("203.0.113.53")
+	finalAnswer := [4]byte{203, 0, 113, 10}
+	queries := [][]net.IP{}
+
+	response, err := dnsQueryWithExchanger([]net.IP{rootServer}, question, func(servers []net.IP, q dnsmessage.Question) (*dnsmessage.Parser, *dnsmessage.Header, error) {
+		queries = append(queries, append([]net.IP(nil), servers...))
+		if len(queries) == 1 {
+			return parserForMessage(t, dnsmessage.Message{
+				Header:    dnsmessage.Header{Response: true},
+				Questions: []dnsmessage.Question{q},
+				Authorities: []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{
+							Name:  dnsmessage.MustNewName("com."),
+							Type:  dnsmessage.TypeNS,
+							Class: dnsmessage.ClassINET,
+						},
+						Body: &dnsmessage.NSResource{NS: dnsmessage.MustNewName("a.gtld-servers.net.")},
+					},
+				},
+				Additionals: []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{
+							Name:  dnsmessage.MustNewName("a.gtld-servers.net."),
+							Type:  dnsmessage.TypeA,
+							Class: dnsmessage.ClassINET,
+						},
+						Body: &dnsmessage.AResource{A: [4]byte{203, 0, 113, 53}},
+					},
+				},
+			})
+		}
+
+		return parserForMessage(t, dnsmessage.Message{
+			Header:    dnsmessage.Header{Response: true, Authoritative: true},
+			Questions: []dnsmessage.Question{q},
+			Answers: []dnsmessage.Resource{
+				{
+					Header: dnsmessage.ResourceHeader{
+						Name:  q.Name,
+						Type:  dnsmessage.TypeA,
+						Class: dnsmessage.ClassINET,
+					},
+					Body: &dnsmessage.AResource{A: finalAnswer},
+				},
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("dnsQueryWithExchanger error: %s", err)
+	}
+	if len(queries) != 2 {
+		t.Fatalf("expected 2 iterative queries, got %d", len(queries))
+	}
+	if !queries[0][0].Equal(rootServer) {
+		t.Fatalf("first query should go to root server, got %v", queries[0])
+	}
+	if !queries[1][0].Equal(authoritativeServer) {
+		t.Fatalf("second query should go to glue server %s, got %v", authoritativeServer, queries[1])
+	}
+	if response.Header.RCode != dnsmessage.RCodeSuccess {
+		t.Fatalf("expected successful response, got %s", response.Header.RCode.String())
+	}
+	if len(response.Answers) != 1 {
+		t.Fatalf("expected one final answer, got %d", len(response.Answers))
+	}
+	gotAnswer := response.Answers[0].Body.(*dnsmessage.AResource).A
+	if gotAnswer != finalAnswer {
+		t.Fatalf("expected final A answer %v, got %v", finalAnswer, gotAnswer)
+	}
+}
+
+func TestDnsQueryDebugExplainsRootAndGlueSteps(t *testing.T) {
+	question := dnsmessage.Question{
+		Name:  dnsmessage.MustNewName("www.exemplo.com."),
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	}
+	var logs bytes.Buffer
+	previousOutput := debugLogger.Writer()
+	debugLogger.SetOutput(&logs)
+	defer debugLogger.SetOutput(previousOutput)
+
+	_, err := dnsQueryWithExchanger([]net.IP{net.ParseIP("198.41.0.4")}, question, func(servers []net.IP, q dnsmessage.Question) (*dnsmessage.Parser, *dnsmessage.Header, error) {
+		return parserForMessage(t, dnsmessage.Message{
+			Header:    dnsmessage.Header{Response: true, Authoritative: true},
+			Questions: []dnsmessage.Question{q},
+			Answers: []dnsmessage.Resource{
+				{
+					Header: dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+					Body:   &dnsmessage.AResource{A: [4]byte{203, 0, 113, 10}},
+				},
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("dnsQueryWithExchanger error: %s", err)
+	}
+
+	output := logs.String()
+	if !strings.Contains(output, "servidores raiz") {
+		t.Fatalf("expected debug log to explain root servers, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Resposta autoritativa recebida") {
+		t.Fatalf("expected debug log to explain authoritative answer, got:\n%s", output)
+	}
+}
+
+func TestGerRootServersTrimsConfiguredAddresses(t *testing.T) {
+	for _, server := range gerRootServers() {
+		if server == nil {
+			t.Fatalf("expected all root server addresses to parse")
+		}
+	}
+}
+
+func parserForMessage(t *testing.T, message dnsmessage.Message) (*dnsmessage.Parser, *dnsmessage.Header, error) {
+	t.Helper()
+	packed, err := message.Pack()
+	if err != nil {
+		t.Fatalf("Pack error: %s", err)
+	}
+	var parser dnsmessage.Parser
+	header, err := parser.Start(packed)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := parser.SkipAllQuestions(); err != nil {
+		return nil, nil, err
+	}
+	return &parser, &header, nil
 }
